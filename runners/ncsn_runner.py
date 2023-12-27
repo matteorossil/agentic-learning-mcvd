@@ -347,6 +347,8 @@ class NCSNRunner():
         # Initialize meters
         self.init_meters()
 
+        print()
+
         # Initial samples
         n_init_samples = min(36, self.config.training.batch_size)
         init_samples_shape = (n_init_samples, self.config.data.channels*self.config.data.num_frames, self.config.data.image_size, self.config.data.image_size)
