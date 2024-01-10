@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as Transforms
 
+from torchvision import datasets, transforms
+
 from cv2 import rectangle, putText
 from functools import partial
 from math import ceil, log10
@@ -48,6 +50,31 @@ from models.ema import EMAHelper
 from models.fvd.fvd import get_fvd_feats, frechet_distance, load_i3d_pretrained
 from models.unet import UNet_SMLD, UNet_DDPM
 #import pdb; pdb.set_trace()
+
+class CustomImageFolder(datasets.ImageFolder):
+    def __init__(self, root, N=1, transform=None):
+        super(CustomImageFolder, self).__init__(root, transform=transform)
+        self.N = N  # Number of images to concatenate
+
+    def __getitem__(self, index):
+        # Compute indices for N consecutive images, wrapping around if necessary
+        indices = [(index + i) % len(self.samples) for i in range(self.N)]
+
+        # Get paths and targets for N consecutive (or wrapped) images
+        paths, targets = zip(*[self.samples[i] for i in indices])
+
+        # Load and transform images
+        images = [self.transform(self.loader(path)) if self.transform is not None else self.loader(path) for path in paths]
+
+        # Stack images along the channel dimension
+        sample = torch.stack(images, dim=0)
+        
+        target = targets[0]  # You may want to adjust how the target is determined
+
+        return sample, target
+
+    def __len__(self):
+        return len(self.samples)
 
 __all__ = ['NCSNRunner']
 
@@ -106,7 +133,7 @@ def conditioning_fn(config, X, num_frames_pred=0, prob_mask_cond=0.0, prob_mask_
     if not conditional:
         return X.reshape(len(X), -1, imsize, imsize), None, None
 
-    cond = config.data.num_frames_cond
+    cond = config.data.num_frames_cond 
     train = config.data.num_frames
     pred = num_frames_pred
     future = getattr(config.data, "num_frames_future", 0)
@@ -244,18 +271,40 @@ class NCSNRunner():
         hrs = time_hr.split(":")
         return float(days)*24 + float(hrs[0]) + float(hrs[1])/60 + float(hrs[2])/3600
 
+
     def train(self):
+
+        # simple augmentation
+        train_transform = transforms.Compose([
+                                            transforms.RandomResizedCrop(224 if self.config.data.image_size < 256 else 256),
+                                            transforms.Resize(self.config.data.image_size),
+                                            transforms.RandomHorizontalFlip(p=(0.5 if self.config.data.random_flip else 0.0)),
+                                            transforms.ToTensor(),
+                                            #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                            ])
+        val_transform = transforms.Compose([
+                                            transforms.Resize(256),
+                                            transforms.CenterCrop(224),
+                                            transforms.Resize(self.config.data.image_size),
+                                            transforms.ToTensor(),
+                                            #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                            ])
+
         # If FFHQ tfrecord, reset dataloader
         if self.config.data.dataset.upper() == 'FFHQ':
             dataloader = FFHQ_TFRecordsDataLoader([self.args.data_path], self.config.training.batch_size, self.config.data.image_size)
             test_loader = FFHQ_TFRecordsDataLoader([self.args.data_path], self.config.training.batch_size, self.config.data.image_size)
             test_iter = iter(test_loader)
         else:
-            dataset, test_dataset = get_dataset(self.args.data_path, self.config, video_frames_pred=self.config.data.num_frames, start_at=self.args.start_at)
-            dataloader = DataLoader(dataset, batch_size=self.config.training.batch_size, shuffle=True,
-                                    num_workers=self.config.data.num_workers)
-            test_loader = DataLoader(test_dataset, batch_size=self.config.training.batch_size, shuffle=True,
-                                     num_workers=self.config.data.num_workers, drop_last=True)
+            #dataset, test_dataset = get_dataset(self.args.data_path, self.config, video_frames_pred=self.config.data.num_frames, start_at=self.args.start_at)
+            N = self.config.data.num_frames_cond + self.config.data.num_frames + self.config.data.num_frames_future
+            dataset = CustomImageFolder(self.args.data_path, N=N, transform=train_transform)
+            print(dataset)
+            dataloader = DataLoader(dataset, batch_size=self.config.training.batch_size, shuffle=True, num_workers=self.config.data.num_workers)
+            
+            test_dataset = CustomImageFolder(self.args.data_val_path, N=N, transform=val_transform)
+            print(test_dataset)
+            test_loader = DataLoader(test_dataset, batch_size=self.config.training.batch_size, shuffle=True, num_workers=self.config.data.num_workers, drop_last=True)
             test_iter = iter(test_loader)
 
         self.config.input_dim = self.config.data.image_size ** 2 * self.config.data.channels
@@ -347,8 +396,6 @@ class NCSNRunner():
         # Initialize meters
         self.init_meters()
 
-        print()
-
         # Initial samples
         n_init_samples = min(36, self.config.training.batch_size)
         init_samples_shape = (n_init_samples, self.config.data.channels*self.config.data.num_frames, self.config.data.image_size, self.config.data.image_size)
@@ -371,7 +418,7 @@ class NCSNRunner():
 
         early_end = False
         for epoch in range(start_epoch, self.config.training.n_epochs):
-            for batch, (X, y) in enumerate(dataloader):
+            for batch, (X, _) in enumerate(dataloader):
 
                 optimizer.zero_grad()
                 lr = warmup_lr(optimizer, step, getattr(self.config.optim, 'warmup', 0), self.config.optim.lr)
@@ -381,6 +428,7 @@ class NCSNRunner():
                 # Data
                 X = X.to(self.config.device)
                 X = data_transform(self.config, X)
+
                 X, cond, cond_mask = conditioning_fn(self.config, X, num_frames_pred=self.config.data.num_frames,
                                                      prob_mask_cond=getattr(self.config.data, 'prob_mask_cond', 0.0),
                                                      prob_mask_future=getattr(self.config.data, 'prob_mask_future', 0.0),
@@ -453,6 +501,9 @@ class NCSNRunner():
 
                 # Validation
                 if step == 1 or step % self.config.training.val_freq == 0:
+
+                    print("VALIDATION")
+
                     try:
                         test_X, test_y = next(test_iter)
                     except StopIteration:
@@ -490,6 +541,8 @@ class NCSNRunner():
 
                 # Sample from model
                 if (step % self.config.training.snapshot_freq == 0 or step % self.config.training.sample_freq == 0) and self.config.training.snapshot_sampling:
+                    
+                    print("SAMPLING")
 
                     logging.info(f"Saving images in {self.args.log_sample_path}")
 
@@ -1044,7 +1097,7 @@ class NCSNRunner():
                         z = z - used_k*used_theta
                     else:
                         z = torch.randn(init_samples_shape, device=self.config.device)
-                        # z = data_transform(self.config, z)
+                        z = data_transform(self.config, z)
 
                 # init_samples
                 if self.config.sampling.data_init:
@@ -1117,7 +1170,7 @@ class NCSNRunner():
                         z = z - used_k*used_theta
                     else:
                         z = torch.randn(init_samples_shape, device=self.config.device)
-                        # z = data_transform(self.config, z)
+                        z = data_transform(self.config, z)
 
                 # init_samples
                 if self.config.sampling.data_init:
@@ -1230,7 +1283,7 @@ class NCSNRunner():
                         z = z - used_k*used_theta
                     else:
                         z = torch.randn(init_samples_shape, device=self.config.device)
-                        # z = data_transform(self.config, z)
+                        z = data_transform(self.config, z)
 
                 # init_samples
                 if self.config.sampling.data_init:
@@ -1387,7 +1440,6 @@ class NCSNRunner():
                 ema_helper.load_state_dict(states[-1])
                 ema_helper.ema(scorenet)
 
-
         net = scorenet.module if hasattr(scorenet, 'module') else scorenet
 
         # Collate fn for n repeats
@@ -1410,10 +1462,25 @@ class NCSNRunner():
         elif self.condp > 0.0 and self.futrf > 0 and self.futrp > 0.0 and self.prob_mask_sync:     # (1) Interp + (3) Gen
             num_frames_pred = max(self.config.data.num_frames, self.config.sampling.num_frames_pred)
 
+        """
         dataset_train, dataset_test = get_dataset(self.args.data_path, self.config, video_frames_pred=num_frames_pred, start_at=self.args.start_at)
         dataset = dataset_train if getattr(self.config.sampling, "train", False) else dataset_test
         dataloader = DataLoader(dataset, batch_size=self.config.sampling.batch_size//preds_per_test, shuffle=True,
                                 num_workers=self.config.data.num_workers, drop_last=False, collate_fn=my_collate)
+        data_iter = iter(dataloader)
+        """
+        # simple augmentation
+        transform = transforms.Compose([
+                                    transforms.Resize(256),
+                                    transforms.CenterCrop(224),
+                                    transforms.Resize(self.config.data.image_size),
+                                    transforms.ToTensor(),
+                                    #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                                    ])
+
+        N = self.config.sampling.num_frames_pred + self.config.data.num_frames_cond
+        dataset = CustomImageFolder(self.args.data_val_path, N=N, transform=transform)
+        dataloader = DataLoader(dataset, batch_size=self.config.training.batch_size, shuffle=True, num_workers=self.config.data.num_workers, drop_last=True)
         data_iter = iter(dataloader)
 
         if self.config.sampling.data_init:
@@ -1434,6 +1501,7 @@ class NCSNRunner():
         #model_lpips = torch.nn.DataParallel(model_lpips)
         #model_lpips.eval()
         # Sampler
+
         sampler = self.get_sampler()
 
         for i, (real_, _) in tqdm(enumerate(dataloader), total=min(max_data_iter, len(dataloader)), desc="\nvideo_gen dataloader"):
@@ -1741,6 +1809,14 @@ class NCSNRunner():
                 pred2 = inverse_data_transform(self.config, pred2)
                 # pred has length of multiple of n (because we repeat data sample n times)
 
+                print(real.shape)
+
+                print(real2.shape)
+
+                print(pred.shape)
+
+                print(pred2.shape)
+
                 if real.shape[1] < pred.shape[1]: # We cannot calculate MSE, PSNR, SSIM
                     print("-------- Warning: Cannot calculate metrics because predicting beyond the training data range --------")
                     for ii in range(len(pred)):
@@ -1756,6 +1832,7 @@ class NCSNRunner():
                             # MSE (and PSNR)
                             pred_ij = pred2[ii, (self.config.data.channels*jj):(self.config.data.channels*jj + self.config.data.channels), :, :]
                             real_ij = real2[ii, (self.config.data.channels*jj):(self.config.data.channels*jj + self.config.data.channels), :, :]
+                            
                             mse += F.mse_loss(real_ij, pred_ij)
 
                             pred_ij_pil = Transforms.ToPILImage()(pred_ij).convert("RGB")
@@ -1814,7 +1891,7 @@ class NCSNRunner():
                             z = z - used_k*used_theta
                         else:
                             z = torch.randn(init_samples_shape, device=self.config.device)
-                            # z = data_transform(self.config, z)
+                            z = data_transform(self.config, z)
 
                     # init_samples
                     if self.config.sampling.data_init:
@@ -2190,6 +2267,8 @@ class NCSNRunner():
                 elif self.condp > 0.0 and self.futrf > 0 and self.futrp > 0.0 and self.prob_mask_sync:     # (1) Interp + (2) Pred + (3) Gen
                     save_interp(pred, real)
                     save_gen(pred_uncond)
+            
+            break
 
         if no_metrics:
             return None
@@ -2368,6 +2447,7 @@ class NCSNRunner():
 
             logging.info(f"elapsed: {elapsed}, {format_p(vid_metrics)}")
             self.write_to_yaml(os.path.join(self.args.video_folder, 'vid_metrics.yml'), vid_metrics)
+
 
     def test(self):
         scorenet = get_model(self.config)
